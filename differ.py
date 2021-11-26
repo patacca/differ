@@ -1,12 +1,9 @@
 # Author: patacca
-# License: GPLv2
+# License: GPLv3
 
 
-import sys, logging, hashlib, collections, random, time, sqlite3, json, re
+import sys, logging, hashlib, collections, random, time, sqlite3, json, re, os
 import angr
-
-from sortedcontainers import SortedKeyList
-from functools import cached_property
 
 X86_GRP_JUMP = 1
 X86_GRP_BRANCH_RELATIVE = 7
@@ -67,12 +64,14 @@ class Differ:
 		# Parse the binaries
 		self.primary = angr.Project(primary, load_options={'auto_load_libs': False}, use_sim_procedures=False)
 		self.secondary = angr.Project(secondary, load_options={'auto_load_libs': False}, use_sim_procedures=False)
+		self.primaryName = os.path.basename(self.primary.filename)
+		self.secondaryName = os.path.basename(self.secondary.filename)
 		
 		self.primaryCFG = self.primary.analyses.CFGFast(resolve_indirect_jumps=True, normalize=True)
 		self.secondaryCFG = self.secondary.analyses.CFGFast(resolve_indirect_jumps=True, normalize=True)
 		
-		self.primaryFunctions = {a:f for a,f in self.primaryCFG.kb.functions.items() if f.binary_name == self.primary.filename and not f.is_plt}
-		self.secondaryFunctions = {a:f for a,f in self.secondaryCFG.kb.functions.items() if f.binary_name == self.secondary.filename and not f.is_plt}
+		self.primaryFunctions = {a:f for a,f in self.primaryCFG.kb.functions.items() if f.binary_name == self.primaryName and not f.is_plt}
+		self.secondaryFunctions = {a:f for a,f in self.secondaryCFG.kb.functions.items() if f.binary_name == self.secondaryName and not f.is_plt}
 		
 		# Generate the hyperplanes for the LSH
 		# Each hyperplane is identified by its normal vector v from R^2000: v * x = 0
@@ -107,14 +106,17 @@ class Differ:
 	def log(self, msg):
 		self.logger.log(100, msg)
 	
-	def lsh(self, block):
-		'''Use a Locality Sensitive Hashing (LSH) algorithm to hash a block of code'''
+	def getBOW(self, block):
+		'''Extract the bag-of-words representation of a block'''
 		
 		bag = collections.defaultdict(int)
-		
 		for instr in block.disassembly.insns:
 			# For now only use the id
 			bag[instr.id] += 1
+		return bag
+	
+	def lsh(self, bag):
+		'''Use a Locality Sensitive Hashing (LSH) algorithm to hash a bag-of-words'''
 		
 		resHash = 0
 		for hp in self.hyperplanes:
@@ -134,7 +136,7 @@ class Differ:
 		
 		# Label each node of the graph with LSH
 		for n in func.blocks:
-			labels.append(self.lsh(n))
+			labels.append(self.getBOW(n))
 			# We have to get the BlockNode from the corresponding Block and map
 			# it to our node index
 			mapNodeToLabel[func.get_node(n.addr)] = len(labels)-1
@@ -143,23 +145,21 @@ class Differ:
 		for edge in func.graph.edges:
 			adjacency[mapNodeToLabel[edge[0]]].append(mapNodeToLabel[edge[1]])
 		
-		vec = [l for l in labels]
+		vec = [self.lsh(l) for l in labels]
 		for rep in range(len(labels)):
 			# Recalculate labels
 			newLabels = []
 			for node,label in enumerate(labels):
-				l = bin(label)
-				neigh = []
+				l = label.copy()
 				for neighbor in adjacency[node]:
-					neigh.append(bin(labels[neighbor]))
-				neigh.sort()
-				l += ''.join(neigh)
+					for k,v in labels[neighbor].items():
+						l[k] += v
 				
 				# Add 2**32 to avoid confusion with the LSH hashes
-				newLabels.append(2**32 + fnvStr(l))
+				newLabels.append(l)
 			
 			labels = newLabels
-			vec.extend([l for l in labels])
+			vec.extend([self.lsh(l) for l in labels])
 		
 		# Generate the frequency vector of the labels
 		return dict(collections.Counter(vec))
@@ -232,9 +232,6 @@ class Differ:
 			fng = self.fingerprint(f2)
 			if fng in fingerprints1:
 				for f1 in fingerprints1[fng]:
-					# This could rewrite some matches but we can safely (reasonably) ignore that
-					# since that would mean there are multiple equal functions.
-					# Without context analysis it is impossible to discerne between those
 					self.matchesPrimary[f1.addr].append(f2)
 					self.matchesSecondary[f2.addr].append(f1)
 		
@@ -247,80 +244,75 @@ class Differ:
 				self.unmatchedSecondary.add(fAddr)
 	
 	def analyze(self):
-		self.log(f'[+] Analyzing files {self.primary.filename} and {self.secondary.filename}')
+		self.log(f'[+] Analyzing files {self.primaryName} and {self.secondaryName}')
+		
+		# Heuristics based matching
 		
 		self.fingerprintMatch()
 		
-		self.debug(f'[d] {len(self.matchesPrimary)} functions from {self.primary.filename} have been matched')
-		self.debug(f'[d] {len(self.matchesSecondary)} functions from {self.secondary.filename} have been matched')
-		self.debug(f'[d] {len(self.unmatchedPrimary)} functions from {self.primary.filename} are still unmatched')
-		self.debug(f'[d] {len(self.unmatchedSecondary)} functions from {self.secondary.filename} are still unmatched')
-		
-		# ~ cont = 0
-		# ~ for fAddr1,f2 in self.matchesPrimary.items():
-			# ~ f1 = self.primaryFunctions[fAddr1]
-			# ~ l = set((f.name for f in f2))
-			# ~ if f1.name not in l:
-				# ~ print('ERROR', f1.name, f2)
-				# ~ continue
-			# ~ if len(l) > 1:
-				# ~ print(f1.name, len(f2))
-				# ~ cont += 1
-		
-		# ~ print(cont)
+		self.debug(f'[d] {len(self.matchesPrimary)} functions from {self.primaryName} have been matched')
+		self.debug(f'[d] {len(self.matchesSecondary)} functions from {self.secondaryName} have been matched')
+		self.debug(f'[d] {len(self.unmatchedPrimary)} functions from {self.primaryName} are still unmatched')
+		self.debug(f'[d] {len(self.unmatchedSecondary)} functions from {self.secondaryName} are still unmatched')
 		
 		primaryFunctions = {fAddr:self.primaryFunctions[fAddr] for fAddr in self.unmatchedPrimary}
 		secondaryFunctions = {fAddr:self.secondaryFunctions[fAddr] for fAddr in self.unmatchedSecondary}
 		
+		# CFG based matching
+		
 		start = time.time()
-		primaryFunctionsFeatures = self.extractFeatures(self.primary.filename, primaryFunctions)
+		primaryFunctionsFeatures = self.extractFeatures(self.primaryName, primaryFunctions)
 		self.info(f'[+] {len(primaryFunctionsFeatures)} functions analyzed in {(time.time()-start):.4f} seconds')
 		
 		start = time.time()
-		secondaryFunctionsFeatures = self.extractFeatures(self.secondary.filename, secondaryFunctions)
+		secondaryFunctionsFeatures = self.extractFeatures(self.secondaryName, secondaryFunctions)
 		self.info(f'[+] {len(secondaryFunctionsFeatures)} functions analyzed in {(time.time()-start):.4f} seconds')
+		
+		# Acceptance threshold
+		threshold = 0.4
 		
 		start = time.time()
 		matches = {'primary' : {}, 'secondary' : collections.defaultdict(list)}
-		# ~ perfectMatches = {'primary' : {}, 'secondary' : collections.defaultdict(list)}
 		unmatchedFunctions = {'primary' : set(), 'secondary' : set()}
 		for addr1,(vec1,norm1) in primaryFunctionsFeatures.items():
 			matches['primary'][addr1] = []
-			# ~ perfectMatches['primary'][addr1] = []
 			for addr2,(vec2,norm2) in secondaryFunctionsFeatures.items():
 				prod = fastDotProduct(vec1, vec2)
 				norm = (norm1*norm2)**0.5
 				matches['primary'][addr1].append((prod/norm, addr2))
 				matches['secondary'][addr2].append((prod/norm, addr1))
-				# ~ if prod == norm:
-					# ~ perfectMatches['primary'][addr1].append(addr2)
-					# ~ perfectMatches['secondary'][addr2].append(addr1)
 			
 			# Sort by the matching score
 			matches['primary'][addr1].sort(key=lambda x: -x[0])
-			
-			if matches['primary'][addr1][0][0] < 0.2:
+			if matches['primary'][addr1][0][0] < threshold:
 				unmatchedFunctions['primary'].add(addr1)
 		
 		for addr in secondaryFunctionsFeatures:
 			matches['secondary'][addr].sort(key=lambda x: -x[0])
-			if matches['secondary'][addr][0][0] < 0.2:
+			if matches['secondary'][addr][0][0] < threshold:
 				unmatchedFunctions['secondary'].add(addr)
-			# ~ if len(perfectMatches['secondary'][addr]) == 0:
-				# ~ unmatchedFunctions['secondary'].add(addr)
-				# ~ # Sort only when there isn't a perfect match
-				# ~ matches['secondary'][addr].sort(key=lambda x: -x[0])
 		
 		self.info(f'[+] CFG matching completed in {(time.time()-start):.4f} seconds')
 		self.log('\n-- REPORT --\n')
-		self.log(f'{len(matches["primary"])-len(unmatchedFunctions["primary"])} functions from {self.primary.filename} have a perfect match in {self.secondary.filename}')
-		self.log(f'{len(matches["secondary"])-len(unmatchedFunctions["secondary"])} functions from {self.secondary.filename} have a perfect match in {self.primary.filename}')
+		self.log(f'{len(self.matchesPrimary)} functions from {self.primaryName} have not been modified')
+		self.log(f'{len(matches["primary"])-len(unmatchedFunctions["primary"])} functions from {self.primaryName} have been modified')
+		self.log(f'{len(unmatchedFunctions["primary"])} functions from {self.primaryName} have been removed')
+		self.log(f'{len(unmatchedFunctions["secondary"])} functions from {self.secondaryName} have been added')
+		self.log('\n-- MODIFIED FUNCTIONS --')
 		
-		print([self.primaryCFG.functions[f].name for f in unmatchedFunctions['primary']])
+		for addr1,m in matches["primary"].items():
+			score,addr2 = m[0]
+			self.log(f'{self.primaryFunctions[addr1].name} has been matched to {self.secondaryFunctions[addr2].name} with a score of {score}')
 		
-		for addr1 in unmatchedFunctions['primary']:
-			print(f'{self.primaryCFG.functions[addr1].name}')
-			print(matches['primary'][addr1][:5])
+		self.log('\n-- REMOVED FUNCTIONS --')
+		
+		for addr in unmatchedFunctions['primary']:
+			self.log(f'{self.primaryFunctions[addr].name}')
+		
+		self.log('\n-- ADDED FUNCTIONS --')
+		
+		for addr in unmatchedFunctions['secondary']:
+			self.log(f'{self.secondaryFunctions[addr].name} has been added')
 
 def main():
 	differ = Differ(sys.argv[1], sys.argv[2], verbosity=logging.DEBUG)
